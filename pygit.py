@@ -164,7 +164,7 @@ def read_index():
     assert len(entries) == num_entries
     return entries
 
-def ls_file(details = False):
+def ls_files(details = False):
     for entry in read_index():
         if details:
             stage = (entry.flags >> 12) & 3
@@ -347,3 +347,234 @@ def extract_lines(data):
 
 def build_lines_data(lines):
     #Building byte string from given 
+    result = []
+    for line in lines:
+        result.append(f'{len(line)+5:04x}'.encode())
+        result.append(line)
+        result.append(b'\n')
+    result.append(b'0000')
+    return b''.join(result)
+
+def http_req(url,username,pasword,data = None):
+    """Make an authenticated HTTP request to given URL (GET by default, POST
+        if "data" is not None).
+    """
+    password_manager = urllib.request.HTTPPasswordMgrWithDefaultRealm()
+    password_manager.add_password(None,url,username,pasword)
+    auth_handler = urllib.request.AbstractBasicAuthHandler(password_manager)
+    opener = urllib.request.build_opener(auth_handler)
+    f = opener.open(url,data=data)
+    return f.read()
+
+def get_remote_master_hash(git_url,username,password):
+    # get commit hash of remote branch
+    url = f'{git_url}/info/refs?service=git-receive-pack'
+    response = http_req(url,username,password)
+    lines = extract_lines(response)
+    assert lines[0] == b'# service=git-receive-pack\n' #1st packet is the std Smart HTTP service announcement
+    assert lines[1] == b'' #2nd pkt is an empty flush-pkt separating the header from refs
+    if lines[2][:40] == b'0'*40: #repo is completely empty, the server advertises 40 0s
+        return None
+    
+    master_sha1,master_ref = lines[2].split(b'\x00')[0].split() # Strip off the null-byte (\x00) and server capabilities suffix, then split into "<sha1> <ref_name>"
+    
+    assert master_ref == b'refs/heads/master'
+    assert len(master_sha1) == 40 # 40-char SHA-1 hex str
+    return master_sha1.decode() #ASCII bytes into a std Py str
+
+def read_tree(sha1=None, data=None):
+    """Read tree object with given SHA-1 (hex string) or data, and return list
+    of (mode, path, sha1) tuples.
+    """
+    if sha1 is not None:
+        obj_type, data = read_object(sha1)
+        assert obj_type == 'tree'
+    elif data is None:
+        raise TypeError('must specify "sha1" or "data"')
+    i = 0
+    entries = []
+    for _ in range(1000):
+        end = data.find(b'\x00', i) # Find the null byte (\x00) separating "<mode> <filename>" from the 20-byte SHA-1
+        if end == -1:
+            break
+        mode_str, path = data[i:end].decode().split() #ASCII header before the null byte & split into octal mode and filename
+        mode = int(mode_str, 8) #oct -> int
+        digest = data[end + 1:end + 21]
+        entries.append((mode, path, digest.hex()))
+        i = end + 1 + 20 # 1 = null B & 20 = sha-1 hex
+    return entries
+
+def find_tree_objects(tree_sha1):
+    """Return set of SHA-1 hashes of all objects in this tree,
+    including the hash of the tree itself.
+    """
+    objects = {tree_sha1}
+    for mode, path, sha1 in read_tree(sha1=tree_sha1):
+        if stat.S_ISDIR(mode):
+            objects.update(find_tree_objects(sha1)) #Recure & collect all tree & blob SHA-1s inside the subdirectory & merge into our set
+        else:
+            objects.add(sha1) # Otherwise its a reg file (blob) or symlink; add its SHA-1 hash directly to the set
+    return objects
+
+def find_commit_objects(commit_sha1,visited =None):
+    """Return set of SHA-1 hashes of all obj in this commit,
+    its tree,parents,& the hash of the commit itself.
+    """
+    # Track visited commits to avoid redundant work on merge diamonds & prevent infi loops
+    if visited is None:
+        visited = set()
+    if commit_sha1 in visited:
+        return set()
+    objects = {commit_sha1}
+    obj_type, commit = read_object(commit_sha1) # Fetch & decomp the Git obj from .git/objects,verify its a 'commit'
+    assert obj_type == 'commit'
+    lines = commit.decode().splitlines() #raw commit bytes into UTF-8 text & split into individual lines
+    tree = next(l[5:45] for l in lines if l.startswith('tree '))
+    objects.update(find_tree_objects(tree)) # Recursively collect the root tree hash, all nested subtrees, & all file blobs
+    parents = (l[7:47] for l in lines if l.startswith('parent ')) # Find all 'parent <40-char-sha1>' header lines (0 = root commit, 1 = normal, 2+ = merges)
+    for parent in parents: #trav each parent commit's history & merge its objs into our set
+        objects.update(find_commit_objects(parent,visited))
+    return objects
+
+def find_missing_objects(local_sha1, remote_sha1):
+    '''Return set of SHA-1 hashes of objects in local commit that are missing at the remote (based on the given remote commit hash).'''
+    local_objects = find_commit_objects(local_sha1) # Collect the full set of commit, tree, and blob SHA-1s reachable from our local commit
+    if remote_sha1 is None: #empty repo : up everything
+        return local_objects
+    remote_objects = find_commit_objects(remote_sha1)
+    return local_objects - remote_objects #only objs reachable locally that the remote does not yet have
+
+def encode_pack_object(obj):
+    """Encode a single obj for a pack file & return bytes (var-len header followed by compressed data bytes).
+    """
+    obj_type, data = read_object(obj)
+    type_num = ObjectType[obj_type].value # Convt the type name into Git's numeric packfile type code (1=commit, 2=tree,3=blob,4=tag)
+    size = len(data)
+    byte = (type_num << 4) | (size & 0x0f) # Pack the 3-bit obj type (bits 6–4) & the lowest 4 bits of the size (bits 3–0) into the first byte
+    size >>= 4 # avoid up(^) 4
+    header = []
+    while size:
+        header.append(byte | 0x80) #emit the curr byte with its MSB (0x80) set as a continuatn flag
+        byte = size & 0x7f #7 least-signif bits of the remaining size
+        size >>= 7
+    header.append(byte)
+    return bytes(header) + zlib.compress(data)
+
+    ''' 7     6   5   4     3   2   1   0
+        +---+---------------+---------------+
+        | C |   Object Type |  Size (low 4) |
+        +---+---------------+---------------+
+        │         │               └── Lowest 4 bits uncompressed size (size & 0x0f)
+        │         └────────────────── 3-bit ObjectType enum value (type_num << 4)
+        └──────────────────────────── Continuation bit: 1 if more size bytes follow, 0 if done'''
+def create_pack(objects):
+    """Create pack file containing all objects in given given set of SHA-1 hashes, return data bytes of full pack file.
+    """
+    header = struct.pack('!4sLL', b'PACK', 2, len(objects))
+    '''
+    # - 4-byte signature: b'PACK'
+    # - 4-byte unsigned int (L): packfile version number (2)
+    # - 4-byte unsigned int (L): total count of objects packed inside
+    '''
+    body = b''.join(encode_pack_object(o) for o in sorted(objects)) #Sort obj SHA-1s for deterministic output, encode each into (varint header + zlib data), & concat all encoded objs into a single contiguous byte stream
+    contents = header + body
+    sha1 = hashlib.sha1(contents).digest()
+    data = contents + sha1
+    return data
+
+def push(git_url, username=None, password=None):
+    """Push master branch to given git repo URL."""
+    if username is None:
+        username = os.environ['GIT_USERNAME']
+    if password is None:
+        password = os.environ['GIT_PASSWORD']
+    remote_sha1 = get_remote_master_hash(git_url, username, password)
+    local_sha1 = get_local_master_hash()
+    missing = find_missing_objects(local_sha1, remote_sha1)
+    print(f'updating remote master from {remote_sha1 or 'no commits'} to {local_sha1} ({len(missing)} object{'' if len(missing) == 1 else 's'})')
+    lines = [f'{remote_sha1 or ('0'*40)} {local_sha1} refs/heads/master\x00 report-status'.encode()]
+    data = build_lines_data(lines) + create_pack(missing)
+    url = git_url + '/git-receive-pack'
+    response = http_req(url, username, password, data=data)
+    lines = extract_lines(response)
+    assert len(lines) >= 2,f'expected at least 2 lines, got {len(lines)}'
+    assert lines[0] == b'unpack ok\n', f"expected line 1 b'unpack ok', got: {lines[0]}"
+    assert lines[1] == b'ok refs/heads/master\n', f"expected line 2 b'ok refs/heads/master\n', got: {lines[1]}"
+    return (remote_sha1, missing)
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    sub_parsers = parser.add_subparsers(dest='command', metavar='command')
+    sub_parsers.required = True
+
+    sub_parser = sub_parsers.add_parser('add',help='add file(s) to index')
+    sub_parser.add_argument('paths', nargs='+', metavar='path',help='path(s) of files to add')
+
+    sub_parser = sub_parsers.add_parser('cat-file',
+            help='display contents of object')
+    valid_modes = ['commit', 'tree', 'blob', 'size', 'type', 'pretty']
+    sub_parser.add_argument('mode', choices=valid_modes,
+            help='object type (commit, tree, blob) or display mode (size,''type, pretty)')
+    sub_parser.add_argument('hash_prefix',
+            help='SHA-1 hash (or hash prefix) of object to display')
+
+    sub_parser = sub_parsers.add_parser('commit',
+            help='commit current state of index to master branch')
+    sub_parser.add_argument('-a', '--author',
+            help='commit author in format "A U Thor <author@example.com>" (uses GIT_AUTHOR_NAME and GIT_AUTHOR_EMAIL environment variables by default)')
+    sub_parser.add_argument('-m', '--message', required=True,
+            help='text of commit message')
+
+    sub_parser = sub_parsers.add_parser('diff',
+            help='show diff of files changed (between index and working''copy)')
+
+    sub_parser = sub_parsers.add_parser('hash-object',
+            help='hash contents of given path (and optionally write to object store)')
+    sub_parser.add_argument('path',
+            help='path of file to hash')
+    sub_parser.add_argument('-t', choices=['commit', 'tree', 'blob'],default='blob', dest='type',
+            help='type of object (default %(default)r)')
+    sub_parser.add_argument('-w', action='store_true',      dest='write',
+            help='write object to object store (as well as printing hash)')
+
+    sub_parser = sub_parsers.add_parser('init',
+            help='initialize a new repo')
+    sub_parser.add_argument('repo',
+            help='directory name for new repo')
+
+    sub_parser = sub_parsers.add_parser('ls-files',
+            help='list files in index')
+    sub_parser.add_argument('-s', '--stage', action='store_true',
+            help='show object details (mode, hash, and stage number) in addition to path')
+
+    sub_parser = sub_parsers.add_parser('push',
+            help='push master branch to given git server URL')
+    sub_parser.add_argument('git_url',
+            help='URL of git repo, eg: https://github.com/benhoyt/pygit.git')
+    sub_parser.add_argument('-p', '--password',
+            help='password to use for authentication (uses GIT_PASSWORD environment variable by default)')
+    sub_parser.add_argument('-u', '--username',
+            help='username to use for authentication (uses GIT_USERNAME environment variable by default)')
+
+    sub_parser = sub_parsers.add_parser('status',
+            help='show status of working copy')
+
+    args = parser.parse_args()
+    if args.command == 'add': add(args.paths)
+    elif args.command == 'cat-file':
+        try:
+            cat_file(args.mode, args.hash_prefix)
+        except ValueError as error:
+            print(error, file=sys.stderr)
+            sys.exit(1)
+    elif args.command == 'commit': commit(args.message, author=args.author)
+    elif args.command == 'diff': diff()
+    elif args.command == 'hash-object':
+        sha1 = hash_obj(read_file(args.path), args.type, write=args.write)
+        print(sha1)
+    elif args.command == 'init': init(args.repo)
+    elif args.command == 'ls-files': ls_files(details=args.stage)
+    elif args.command == 'push':
+        push(args.git_url, username=args.username, password=args.password)
+    elif args.command == 'status': status()
+    else: assert False, f'unexpected command {args.command!r}'
